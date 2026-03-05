@@ -12,19 +12,22 @@ use std::{
     str::FromStr,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
-        Arc, OnceLock,
+        Arc,
     },
     time::{Duration, Instant},
 };
 
 use arc_swap::ArcSwap;
 use axum::{
+    debug_handler,
+    extract::State,
     http::header::HeaderValue,
     response::Response,
     routing::{get, post},
     Json,
 };
 use bytes::Bytes;
+use dectalk;
 use mini_moka::sync::Cache;
 use reqwest::StatusCode;
 use serde_json::to_value;
@@ -33,9 +36,11 @@ use sha2::{
     Digest,
 };
 use small_fixed_array::{FixedString, ValidLength};
+use tokio::sync::{Mutex, RwLock};
 use tracing::level_filters::LevelFilter;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
+mod dectalk_tts;
 mod espeak;
 mod gcloud;
 mod gtts;
@@ -91,19 +96,22 @@ struct GetVoices {
 }
 
 async fn get_voices(
+    State(state): State<AppState>,
     axum::extract::Query(payload): axum::extract::Query<GetVoices>,
 ) -> ResponseResult<impl axum::response::IntoResponse> {
     let GetVoices { mode, raw } = payload;
-    let state = STATE.get().unwrap();
 
-    mode.check_keys(state)?;
-    
+    mode.check_keys(&state)?;
+
     Ok(axum::Json(if raw {
         match mode {
             TTSMode::gTTS => to_value(gtts::get_raw_voices()),
             TTSMode::eSpeak => to_value(espeak::get_voices()),
             TTSMode::Polly => to_value(polly::get_raw_voices(&state.polly).await?),
-            TTSMode::gCloud => to_value(gcloud::get_raw_voices(&state.gcloud.as_ref().unwrap()).await?),
+            TTSMode::gCloud => {
+                to_value(gcloud::get_raw_voices(&state.gcloud.as_ref().unwrap()).await?)
+            }
+            TTSMode::dectalk => to_value(dectalk_tts::get_voices()),
         }?
     } else {
         to_value(match mode {
@@ -111,12 +119,14 @@ async fn get_voices(
             TTSMode::eSpeak => espeak::get_voices().to_vec(),
             TTSMode::Polly => polly::get_voices(&state.polly).await?,
             TTSMode::gCloud => gcloud::get_voices(&state.gcloud.as_ref().unwrap()).await?,
+            TTSMode::dectalk => dectalk_tts::get_voices(),
         })?
     }))
 }
 
-async fn get_translation_languages() -> ResponseResult<Json<Vec<(FixedString, FixedString)>>> {
-    let state = STATE.get().unwrap();
+async fn get_translation_languages(
+    State(state): State<AppState>,
+) -> ResponseResult<Json<Vec<(FixedString, FixedString)>>> {
     let Some(token) = &state.translation_key else {
         return Ok(Json(Vec::new()));
     };
@@ -134,8 +144,8 @@ struct CacheInfo {
     total: u64,
 }
 
-async fn get_cache_info() -> Json<CacheInfo> {
-    let cache = STATE.get().unwrap().cache.load();
+async fn get_cache_info(State(state): State<AppState>) -> Json<CacheInfo> {
+    let cache = state.cache.load();
     let hits = cache.hits.load(Ordering::Relaxed);
     let misses = cache.misses.load(Ordering::Relaxed);
 
@@ -152,10 +162,9 @@ struct RefreshCache {
 }
 
 async fn refresh_cache(
+    State(state): State<AppState>,
     Json(RefreshCache { new_capacity }): Json<RefreshCache>,
 ) -> reqwest::StatusCode {
-    let state = STATE.get().unwrap();
-
     state.cache.store(Arc::new(AudioCache {
         inner: Cache::new(new_capacity),
         misses: AtomicU64::new(0),
@@ -180,8 +189,10 @@ struct GetTTS {
     translation_lang: Option<FixedString<u8>>,
 }
 
+#[debug_handler]
 #[expect(clippy::too_many_lines)]
 async fn get_tts(
+    State(state): State<AppState>,
     axum::extract::Query(payload): axum::extract::Query<GetTTS>,
     headers: axum::http::HeaderMap,
 ) -> ResponseResult<Response<axum::body::Body>> {
@@ -198,14 +209,14 @@ async fn get_tts(
         },
     );
 
-    let state = STATE.get().unwrap();
+    // let state = unsafe { STATE.get_mut() }.unwrap();
     if let Some(auth_key) = state.auth_key.as_deref() {
         let auth_header = headers.get("Authorization");
         if auth_header.map(HeaderValue::to_str).transpose()? != Some(auth_key) {
             return Err(Error::Unauthorized);
         }
     }
-    
+
     let translation_lang = payload.translation_lang;
     let preferred_format = payload.preferred_format;
     let speaking_rate = payload.speaking_rate;
@@ -213,10 +224,10 @@ async fn get_tts(
     let voice = payload.voice;
     let mode = payload.mode;
 
-    mode.check_keys(state)?;
-    
+    mode.check_keys(&state)?;
+
     mode.check_speaking_rate(speaking_rate)?;
-    mode.check_voice(state, &voice).await?;
+    mode.check_voice(&state, &voice).await?;
 
     let mut cache_key = format!("{text} {voice} {mode} {}", speaking_rate.unwrap_or(0.0));
 
@@ -304,6 +315,7 @@ async fn get_tts(
             )
             .await?
         }
+        TTSMode::dectalk => dectalk_tts::get_tts(&text, &voice, state.dectalk).await?,
     };
 
     tracing::debug!("Generated TTS from {cache_key}");
@@ -324,6 +336,22 @@ async fn get_tts(
     Ok(mode.into_response(audio, content_type))
 }
 
+async fn get_tts_modes(State(state): State<AppState>) -> Json<Vec<TTSMode>> {
+    let mut states = Vec::new();
+
+    states.push(TTSMode::gTTS);
+    states.push(TTSMode::Polly);
+    states.push(TTSMode::eSpeak);
+
+    if state.gcloud.is_some() {
+        states.push(TTSMode::gCloud);
+    }
+
+    states.push(TTSMode::dectalk);
+
+    axum::Json(states)
+}
+
 #[derive(serde::Deserialize, Clone, Copy, Debug, PartialEq)]
 #[allow(non_camel_case_types)]
 enum TTSMode {
@@ -331,6 +359,7 @@ enum TTSMode {
     Polly,
     eSpeak,
     gCloud,
+    dectalk,
 }
 
 impl TTSMode {
@@ -348,6 +377,7 @@ impl TTSMode {
                         Self::eSpeak => "audio/wav",
                         Self::gCloud => "audio/opus",
                         Self::Polly => "audio/ogg",
+                        Self::dectalk => "audio/wav",
                     })
                 }),
             )
@@ -355,14 +385,13 @@ impl TTSMode {
             .unwrap()
     }
 
-    async fn check_voice(self, state: &State, voice: &str) -> ResponseResult<()> {
-        self.check_keys(state)?;
-       
+    async fn check_voice(self, state: &AppState, voice: &str) -> ResponseResult<()> {
         if match self {
             Self::gTTS => gtts::check_voice(voice),
             Self::eSpeak => espeak::check_voice(voice),
             Self::gCloud => gcloud::check_voice(&state.gcloud.as_ref().unwrap(), voice).await?,
             Self::Polly => polly::check_voice(&state.polly, voice).await?,
+            Self::dectalk => dectalk_tts::check_voice(voice),
         } {
             return Ok(());
         } else {
@@ -372,7 +401,7 @@ impl TTSMode {
         }
     }
 
-    fn check_keys(self, state: &State) -> ResponseResult<()> {
+    fn check_keys(self, state: &AppState) -> ResponseResult<()> {
         // If we're trying to use gCloud, check for a gCloud key.
         if self == Self::gCloud && state.gcloud.is_none() {
             return Err(Error::NoGcloudKey);
@@ -381,12 +410,11 @@ impl TTSMode {
         Ok(())
     }
 
-
     fn check_length(self, audio: &[u8], max_length: Option<u64>) -> ResponseResult<()> {
         if max_length.is_none_or(|max_length| match self {
             Self::gTTS => check_mp3_length(audio, max_length),
             Self::eSpeak => espeak::check_length(audio, max_length as u32),
-            Self::gCloud | Self::Polly => true,
+            Self::gCloud | Self::Polly | Self::dectalk => true,
         }) {
             Ok(())
         } else {
@@ -408,7 +436,7 @@ impl TTSMode {
 
     const fn max_speaking_rate(self) -> Option<f32> {
         match self {
-            Self::gTTS => None,
+            Self::gTTS | Self::dectalk => None,
             Self::Polly => Some(500.0),
             Self::eSpeak => Some(400.0),
             Self::gCloud => Some(4.0),
@@ -421,6 +449,7 @@ impl TTSMode {
             Self::Polly => "Polly",
             Self::eSpeak => "eSpeak",
             Self::gCloud => "gCloud",
+            Self::dectalk => "dectalk",
         }
     }
 }
@@ -446,19 +475,19 @@ struct AudioCache {
     hits: AtomicU64,
 }
 
-struct State {
+#[derive(Clone)]
+struct AppState {
     auth_key: Option<FixedString<u8>>,
     translation_key: Option<FixedString<u8>>,
     reqwest: reqwest::Client,
 
-    cache: ArcSwap<AudioCache>,
+    cache: Arc<ArcSwap<AudioCache>>,
 
     polly: polly::State,
-    gtts: tokio::sync::RwLock<gtts::State>,
-    gcloud: Option<tokio::sync::RwLock<gcloud::State>>,
+    gtts: Arc<RwLock<gtts::State>>,
+    gcloud: Option<Arc<RwLock<gcloud::State>>>,
+    dectalk: Arc<Mutex<dectalk::TTSHandle>>,
 }
-
-static STATE: OnceLock<State> = OnceLock::new();
 
 fn str_to_fixedstring<LenT: ValidLength>(str: String) -> FixedString<LenT> {
     FixedString::try_from(str.into_boxed_str()).expect("string should be less than 256 chars long")
@@ -483,18 +512,21 @@ async fn main() -> Result<()> {
     };
 
     let client = reqwest::Client::new();
-    let result = STATE.set(State {
+
+    let state = AppState {
         reqwest: client.clone(),
         gcloud: {
             let gcloud = gcloud::State::new(client);
 
             match gcloud {
-                Ok(gc) => Some(gc),
+                Ok(gc) => Some(Arc::new(gc)),
                 Err(_) => None,
             }
         },
         polly: polly::State::new(&aws_config::load_from_env().await),
-        gtts: tokio::sync::RwLock::new(gtts::get_random_ipv6(ip_block).await?),
+        gtts: Arc::new(RwLock::new(gtts::get_random_ipv6(ip_block).await?)),
+        // dectalk: Arc::new(Mutex::new(dectalk_tts::setup_tts())),
+        dectalk: Arc::new(Mutex::new(dectalk::TTSHandle::new())),
 
         cache: {
             let max_cap = std::env::var("CACHE_MAX_CAPACITY")
@@ -505,20 +537,30 @@ async fn main() -> Result<()> {
             let cache = Cache::builder().max_capacity(max_cap).build();
 
             tracing::info!("Initialised audio cache with max capacity: {max_cap}");
-            ArcSwap::from_pointee(AudioCache {
+            Arc::new(ArcSwap::from_pointee(AudioCache {
                 inner: cache,
                 hits: AtomicU64::new(0),
                 misses: AtomicU64::new(0),
-            })
+            }))
         },
 
         auth_key: std::env::var("AUTH_KEY").ok().map(str_to_fixedstring),
         translation_key: std::env::var("DEEPL_KEY").ok().map(str_to_fixedstring),
-    });
+    };
 
-    if result.is_err() {
-        unreachable!()
-    }
+    // Set up DECTalk
+    let mut dectalk_lock = state.dectalk.lock().await;
+    dectalk_lock.startup(0, 0).expect("Failed to start DECTalk");
+    dectalk_lock
+        .open_in_memory(dectalk::DtTTSFormat::WaveFormat1M16)
+        .expect("Failed to open DECTalk in memory");
+    dectalk_lock
+        .create_buffer(
+            dectalk_tts::DATA_BUFFER_SIZE,
+            dectalk_tts::INDEX_BUFFER_SIZE,
+        )
+        .expect("Failed to create buffer");
+    drop(dectalk_lock);
 
     let app = axum::Router::new()
         .route("/tts", get(get_tts))
@@ -526,22 +568,8 @@ async fn main() -> Result<()> {
         .route("/cache", get(get_cache_info))
         .route("/cache", post(refresh_cache))
         .route("/translation_languages", get(get_translation_languages))
-        .route(
-            "/modes",
-            get(|| async {
-                let mut states = Vec::new();
-                
-                states.push(TTSMode::gTTS);
-                states.push(TTSMode::Polly);
-                states.push(TTSMode::eSpeak);
-
-                if STATE.get().unwrap().gcloud.is_some() {
-                    states.push(TTSMode::gCloud);
-                }
-
-                axum::Json(states)
-            }),
-        );
+        .route("/modes", get(get_tts_modes))
+        .with_state(state);
 
     let env_addr = std::env::var("BIND_ADDR");
     let bind_to = env_addr.as_deref().unwrap_or("0.0.0.0:3000");

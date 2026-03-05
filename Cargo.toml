@@ -25,6 +25,8 @@ memchr = "2.7.4"
 aformat = "0.1.4"
 mini-moka = { version = "0.10.3", features = ["sync"] }
 arc-swap = "1.7.1"
+dectalk = "0.4.0"
+hound = "3.5.1"
 
 [dependencies.tracing-subscriber]
 version = "0.3"
@@ -34,7 +36,7 @@ features = ["smallvec", "fmt", "ansi", "parking_lot"]
 [dependencies.axum]
 version = "0.7"
 default-features = false
-features = ["http1", "http2", "json", "query", "tokio"]
+features = ["http1", "http2", "json", "query", "tokio", "macros"]
 
 [dependencies.tokio]
 version = "1"
